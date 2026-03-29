@@ -51,8 +51,15 @@ def stratified_group_split(dataset, train_ratio=0.6, val_ratio=0.2, test_ratio=0
     all_groups = dataset.all_groups
     all_labels = dataset.all_labels
 
+    if len(all_groups) == 0 or len(all_labels) == 0:
+        raise ValueError("数据集为空，无法划分。请先检查数据路径和数据格式是否正确。")
+
     # 提取文件级样本（每个group一个标签）
     unique_groups = np.unique(all_groups)
+    if len(unique_groups) < 3:
+        raise ValueError(
+            f"文件组数量不足（当前 {len(unique_groups)} 组），无法进行 train/val/test 三分。"
+        )
     group_labels = np.array([all_labels[np.where(all_groups == g)[0][0]] for g in unique_groups])
 
     # 第一次划分：训练文件组 vs (验证+测试 文件组)
@@ -193,6 +200,11 @@ def main(args):
     # Get default config
     config = get_default_config()
 
+    # 解析 folder_indices 参数
+    folder_indices = None
+    if args.folder_indices is not None and args.folder_indices.strip() != '':
+        folder_indices = [int(x.strip()) for x in args.folder_indices.split(',') if x.strip() != '']
+
     # Create dataset
     print("\n" + "="*50)
     print("Loading and processing dataset...")
@@ -202,15 +214,25 @@ def main(args):
         base_path=args.data_path,
         lps_config=config['lps_config'],
         if_smooth_config=config['if_smooth_config'],
+        fs=args.fs,
+        file_ext=args.file_ext,
+        signal_col=args.signal_col,
         window_size=args.window_size,
         downsample_factor=args.downsample_factor,
         precompute_order_spec=not args.online_order_spec,
-        folder_indices=[0, 1, 2, 3, 4],  # 包含全部5个类别
+        folder_indices=folder_indices,
         verbose=True
     )
 
-    # 分层划分数据集 (6:2:2)
-    class_names = ['Healthy', 'Inner', 'Outer', 'Ball', 'Combination']
+    # 自动推断类别
+    inferred_num_classes = int(np.max(dataset.all_labels)) + 1
+    if args.num_classes is None:
+        args.num_classes = inferred_num_classes
+    elif args.num_classes < inferred_num_classes:
+        raise ValueError(
+            f"num_classes={args.num_classes} 小于数据集中最大标签+1={inferred_num_classes}，请调整 --num_classes"
+        )
+    class_names = [dataset.get_label_name(i) for i in range(args.num_classes)]
 
     # 按文件分组分层划分 (6:2:2)
     train_indices, val_indices, test_indices = stratified_group_split(
@@ -364,8 +386,8 @@ def main(args):
     # ==================== 生成图表 ====================
     print("\n生成训练结果图表...")
 
-    # 类别名称
-    class_names = ['Healthy', 'Inner', 'Outer', 'Ball', 'Combination']
+    # 类别名称（与模型输出维度一致）
+    class_names = [dataset.get_label_name(i) for i in range(args.num_classes)]
     
     # 创建图表保存目录
     fig_dir = os.path.join(args.save_dir, 'figures')
@@ -404,7 +426,8 @@ def main(args):
     print(f"  保存: {os.path.join(fig_dir, 'accuracy_curve.png')}")
     
     # ========== 图3: 混淆矩阵 (测试集) ==========
-    cm = confusion_matrix(all_labels_test, all_preds)
+    all_class_ids = list(range(args.num_classes))
+    cm = confusion_matrix(all_labels_test, all_preds, labels=all_class_ids)
     fig3, ax3 = plt.subplots(figsize=(10, 8))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
                 xticklabels=class_names[:args.num_classes],
@@ -418,7 +441,13 @@ def main(args):
     print(f"  保存: {os.path.join(fig_dir, 'confusion_matrix.png')}")
     
     # ========== 图4: 归一化混淆矩阵 ==========
-    cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    row_sum = cm.sum(axis=1, keepdims=True).astype(float)
+    cm_normalized = np.divide(
+        cm.astype(float),
+        row_sum,
+        out=np.zeros_like(cm, dtype=float),
+        where=row_sum != 0
+    )
     fig4, ax4 = plt.subplots(figsize=(10, 8))
     sns.heatmap(cm_normalized, annot=True, fmt='.2%', cmap='Blues',
                 xticklabels=class_names[:args.num_classes],
@@ -462,7 +491,12 @@ def main(args):
     axes[1, 0].set_title('Confusion Matrix')
     
     # 子图4: 每类准确率柱状图
-    per_class_acc = cm.diagonal() / cm.sum(axis=1) * 100
+    per_class_acc = np.divide(
+        cm.diagonal().astype(float),
+        cm.sum(axis=1).astype(float),
+        out=np.zeros(cm.shape[0], dtype=float),
+        where=cm.sum(axis=1) != 0
+    ) * 100
     colors = plt.cm.Blues(np.linspace(0.4, 0.8, len(per_class_acc)))
     bars = axes[1, 1].bar(class_names[:args.num_classes], per_class_acc, color=colors, edgecolor='black')
     axes[1, 1].set_xlabel('Class')
@@ -480,9 +514,14 @@ def main(args):
     print(f"  保存: {os.path.join(fig_dir, 'training_summary.png')}")
 
     # ========== 保存分类报告 (测试集) ==========
-    report = classification_report(all_labels_test, all_preds,
-                                   target_names=class_names[:args.num_classes],
-                                   digits=4)
+    report = classification_report(
+        all_labels_test,
+        all_preds,
+        labels=all_class_ids,
+        target_names=class_names[:args.num_classes],
+        digits=4,
+        zero_division=0
+    )
     report_path = os.path.join(fig_dir, 'classification_report.txt')
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*60 + "\n")
@@ -543,7 +582,8 @@ def main(args):
         'Before Gated Fusion',
         'Final Features (Before Classifier)'
     ]
-    colors = ['#e41a1c', '#377eb8', '#4daf4a', '#ff7f00', '#984ea3']
+    cmap = plt.get_cmap('tab20')
+    colors = [cmap(i % 20) for i in range(args.num_classes)]
 
     # 创建2x2子图
     fig_tsne, axes = plt.subplots(2, 2, figsize=(14, 12))
@@ -559,12 +599,15 @@ def main(args):
             feat = pca.fit_transform(feat)
         tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=800, verbose=0)
         feat_2d = tsne.fit_transform(feat)
-        silhouette = silhouette_score(feat_2d, labels_array)
+        if len(np.unique(labels_array)) >= 2:
+            silhouette = silhouette_score(feat_2d, labels_array)
+        else:
+            silhouette = float('nan')
 
         ax = axes[idx]
         for class_idx in range(args.num_classes):
             mask = labels_array == class_idx
-            ax.scatter(feat_2d[mask, 0], feat_2d[mask, 1], c=colors[class_idx],
+            ax.scatter(feat_2d[mask, 0], feat_2d[mask, 1], color=colors[class_idx],
                       label=class_names[class_idx], alpha=0.7, s=40, edgecolors='white', linewidth=0.5)
         ax.set_xlabel('t-SNE Dim 1', fontsize=11)
         ax.set_ylabel('t-SNE Dim 2', fontsize=11)
@@ -587,14 +630,21 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Train TO-XNet')
+    default_save_dir = os.path.abspath(os.path.join(_current_dir, '..', 'checkpoints'))
     parser.add_argument('--data_path', type=str, 
                         default=r'D:/Variable_speed/University_of_Ottawa/Original_data/UO_Bearing',
                         help='Path to dataset')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints', help='Save directory')
+    parser.add_argument('--save_dir', type=str, default=default_save_dir, help='Save directory')
     parser.add_argument('--epochs', type=int, default=30, help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--num_classes', type=int, default=5, help='Number of classes')
+    parser.add_argument('--num_classes', type=int, default=None, help='Number of classes (None=auto infer)')
+    parser.add_argument('--fs', type=int, default=200000, help='Sampling frequency (Hz)')
+    parser.add_argument('--file_ext', type=str, default='auto', choices=['auto', 'mat', 'csv'],
+                        help='Input file format')
+    parser.add_argument('--signal_col', type=int, default=1, help='CSV signal column index (0-based)')
+    parser.add_argument('--folder_indices', type=str, default=None,
+                        help='Comma-separated folder indices, e.g. "0,1,2,3,4"; None means all folders')
     parser.add_argument('--window_size', type=int, default=3072, help='Window size')
     parser.add_argument('--downsample_factor', type=int, default=10, help='Downsample factor')
     parser.add_argument('--num_workers', type=int, default=4, help='DataLoader worker count')

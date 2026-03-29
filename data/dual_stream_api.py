@@ -41,17 +41,17 @@ from data.dual_stream_dataset import DualStreamDataset
 
 DEFAULT_LPS_CONFIG = {
     'nperseg': 32768,
-    'noverlap': None,
-    'min_freq': 10.0,
-    'max_freq': 30.0,
-    'c1': 0.9,
-    'c2': 1.1,
+    'noverlap': 31130,
+    'min_freq': 5.0,
+    'max_freq': 50.0,
+    'c1': 0.8,
+    'c2': 1.2,
     'adaptive_range': True,
-    'lambda_smooth': 0.0,
-    'use_interpolation': True,
+    'lambda_smooth': 0.5,
+    'use_interpolation': False,
     'bidirectional': True,
     'strategy': 'renyi_v1',
-    'strategy_params': {'alpha': 2.0},
+    'strategy_params': {'alpha': 3, 'w1': 1.0, 'w2': 0.5},
 }
 
 DEFAULT_IF_SMOOTH_CONFIG = {
@@ -65,6 +65,8 @@ DEFAULT_IF_SMOOTH_CONFIG = {
 DEFAULT_DATASET_CONFIG = {
     'fs': 200000,
     'signal_length': 2000000,
+    'file_ext': 'auto',
+    'signal_col': 1,
     'window_size': 3072,
     'hop_size': None,  # None means same as window_size (no overlap)
     'downsample_factor': 10,
@@ -104,6 +106,8 @@ def create_dataset(
     if_smooth_config: Optional[Dict] = None,
     fs: int = 200000,
     signal_length: int = 2000000,
+    file_ext: str = 'auto',
+    signal_col: int = 1,
     window_size: int = 3072,
     hop_size: Optional[int] = None,
     downsample_factor: int = 10,
@@ -121,6 +125,8 @@ def create_dataset(
         if_smooth_config: IF smoothing parameters (optional)
         fs: Sampling frequency (Hz)
         signal_length: Signal length per file
+        file_ext: File extension ('auto' | 'mat' | 'csv')
+        signal_col: CSV signal column index
         window_size: Slice window size
         hop_size: Slice step size (None = window_size)
         downsample_factor: Downsampling factor
@@ -141,7 +147,13 @@ def create_dataset(
         folder_indices = [0, 1, 2, 3, 4]  # 包含全部5个类别
 
     # Create dataset
-    dataset = DualStreamDataset(base_path, fs=fs, signal_length=signal_length)
+    dataset = DualStreamDataset(
+        base_path,
+        fs=fs,
+        signal_length=signal_length,
+        file_ext=file_ext,
+        signal_col=signal_col,
+    )
 
     # Build dataset
     dataset.build_dataset(

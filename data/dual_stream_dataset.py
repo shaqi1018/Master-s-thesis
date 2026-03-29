@@ -13,6 +13,7 @@
 import os
 import sys
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -42,7 +43,8 @@ class DualStreamDataset(Dataset):
         4: 'Combination'
     }
     
-    def __init__(self, base_path, fs=200000, signal_length=2000000):
+    def __init__(self, base_path, fs=200000, signal_length=2000000,
+                 file_ext='auto', signal_col=1):
         """
         初始化数据集
         
@@ -54,6 +56,8 @@ class DualStreamDataset(Dataset):
         self.base_path = base_path
         self.fs = fs
         self.signal_length = signal_length
+        self.file_ext = file_ext.lower() if isinstance(file_ext, str) else 'auto'
+        self.signal_col = signal_col
         self.subdirs = self._get_subdirs()
         
         # 数据容器 (build_dataset后填充)
@@ -81,7 +85,17 @@ class DualStreamDataset(Dataset):
     def load_signal(self, folder_idx, filename):
         """加载单个信号文件"""
         file_path = self.get_file_path(folder_idx, filename)
-        return load_channel1_data(file_path)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == '.mat':
+            return load_channel1_data(file_path)
+        if ext == '.csv':
+            df = pd.read_csv(file_path)
+            if self.signal_col >= df.shape[1]:
+                raise ValueError(
+                    f"CSV列索引越界: signal_col={self.signal_col}, 实际列数={df.shape[1]}, 文件={file_path}"
+                )
+            return df.iloc[:, self.signal_col].to_numpy(dtype=np.float32)
+        raise ValueError(f"不支持的文件类型: {ext}, 文件={file_path}")
     
     def get_label(self, folder_idx):
         """获取故障类型标签"""
@@ -89,12 +103,34 @@ class DualStreamDataset(Dataset):
     
     def get_label_name(self, folder_idx):
         """获取故障类型名称"""
-        return self.FAULT_TYPES.get(folder_idx, 'Unknown')
+        return self.FAULT_TYPES.get(folder_idx, self.subdirs[folder_idx] if folder_idx < len(self.subdirs) else 'Unknown')
+
+    def _resolve_file_ext(self, folder_indices):
+        """解析实际读取文件类型: 'mat' | 'csv'"""
+        if self.file_ext in ['mat', 'csv']:
+            return self.file_ext
+
+        for folder_idx in folder_indices:
+            folder_path = os.path.join(self.base_path, self.subdirs[folder_idx])
+            if not os.path.isdir(folder_path):
+                continue
+            files = os.listdir(folder_path)
+            has_mat = any(f.lower().endswith('.mat') for f in files)
+            has_csv = any(f.lower().endswith('.csv') for f in files)
+            if has_mat:
+                return 'mat'
+            if has_csv:
+                return 'csv'
+
+        raise ValueError(
+            f"在数据路径 {self.base_path} 下未发现 .mat 或 .csv 文件，请检查路径是否正确"
+        )
     
-    def list_files(self, folder_idx):
-        """列出指定文件夹中的所有.mat文件"""
+    def list_files(self, folder_idx, resolved_ext='mat'):
+        """列出指定文件夹中的所有目标类型文件"""
         folder_path = os.path.join(self.base_path, self.subdirs[folder_idx])
-        return [f for f in os.listdir(folder_path) if f.endswith('.mat')]
+        ext = f'.{resolved_ext.lower()}'
+        return [f for f in os.listdir(folder_path) if f.lower().endswith(ext)]
     
     def build_dataset(self, lps_config, if_smooth_config,
                       window_size=3072, hop_size=None,
@@ -122,10 +158,19 @@ class DualStreamDataset(Dataset):
         # 默认处理全部5个文件夹（0-4）
         if folder_indices is None:
             folder_indices = [0, 1, 2, 3, 4]
+
+        # 基础校验
+        if len(self.subdirs) == 0:
+            raise ValueError(f"数据路径下未找到子文件夹: {self.base_path}")
+        if max(folder_indices) >= len(self.subdirs):
+            raise ValueError(
+                f"folder_indices 越界: {folder_indices}, 当前仅有 {len(self.subdirs)} 个子文件夹"
+            )
         
         # 保存参数
         self.order_spec_length = order_spec_length
         self.downsample_fs = self.fs // downsample_factor
+        resolved_ext = self._resolve_file_ext(folder_indices)
         
         # 清空容器
         self.all_time_signals = []
@@ -145,9 +190,13 @@ class DualStreamDataset(Dataset):
                 print(f"\n[{folder_idx}] {label_name}: {folder_name}")
             
             # 内层循环：遍历.mat文件
-            mat_files = self.list_files(folder_idx)
+            input_files = self.list_files(folder_idx, resolved_ext=resolved_ext)
+            if len(input_files) == 0:
+                folder_path = os.path.join(self.base_path, folder_name)
+                if verbose:
+                    print(f"  警告: 未检测到 .{resolved_ext} 文件")
             
-            for filename in mat_files:
+            for filename in input_files:
                 file_count += 1
                 group_id = file_count - 1
                 if verbose:
@@ -155,17 +204,20 @@ class DualStreamDataset(Dataset):
                 
                 # 加载原始信号
                 signal_data = self.load_signal(folder_idx, filename)
+
+                # 先降采样，再进行LPS/脊线追踪（与外部测试流程一致）
+                signal_data = signal_data[::downsample_factor]
+
+                # IF平滑配置按降采样后的长度对齐
+                if_smooth_cfg = dict(if_smooth_config)
+                if_smooth_cfg['n_samples'] = len(signal_data)
                 
                 # 调用核心处理函数 (提取IF曲线)
                 result = process_single_file(
-                    signal_data, self.fs, lps_config, if_smooth_config,
+                    signal_data, self.downsample_fs, lps_config, if_smooth_cfg,
                     verbose=False
                 )
-                if_interp = result['if_interp']  # 拉伸后IF (2000000,)
-                
-                # 降采样
-                signal_data = signal_data[::downsample_factor]
-                if_interp = if_interp[::downsample_factor]
+                if_interp = result['if_interp']  # 与降采样信号等长
                 
                 # 计算切片数量
                 n_slices = (len(signal_data) - window_size) // hop_size + 1
@@ -206,6 +258,13 @@ class DualStreamDataset(Dataset):
             self.all_order_specs = np.array(self.all_order_specs, dtype=np.float32)
         else:
             self.all_order_specs = None
+
+        # 无样本时给出明确错误，避免后续划分时报 n_samples=0
+        if len(self.all_time_signals) == 0:
+            raise ValueError(
+                "未构建出任何样本。请检查 data_path 是否为 Ottawa 的 .mat 数据目录（如 UO_Bearing），"
+                "或确认当前读取器与数据格式匹配。"
+            )
         
         if verbose:
             print(f"\n{'='*50}")
@@ -222,6 +281,7 @@ class DualStreamDataset(Dataset):
             print(f"  groups shape: {self.all_groups.shape}, 文件组数: {len(np.unique(self.all_groups))}")
             print(f"  阶次谱长度: {self.order_spec_length}")
             print(f"  阶次谱模式: {'预计算缓存' if precompute_order_spec else '在线计算'}")
+            print(f"  数据格式: .{resolved_ext}, CSV信号列: {self.signal_col}")
             print(f"  标签分布: {self._count_labels()}")
     
     def _count_labels(self):
